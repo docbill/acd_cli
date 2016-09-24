@@ -410,9 +410,12 @@ class ACDFuse(LoggingMixIn, Operations):
                         st_nlink=self.cache.num_children(node.id) if self.nlinks else 1,
                         **times)
         elif node.is_file:
+            bs = self.acd_client._conf.getint('transfer','fs_chunk_size')
             return dict(st_mode=stat.S_IFREG | 0o0666,
                         st_nlink=self.cache.num_parents(node.id) if self.nlinks else 1,
                         st_size=size,
+                        st_blksize=bs,
+                        st_blocks=(node.size+511)//512,
                         **times)
 
     def listxattr(self, path):
@@ -528,7 +531,7 @@ class ACDFuse(LoggingMixIn, Operations):
     def statfs(self, path) -> dict:
         """Gets some filesystem statistics as specified in :manpage:`stat(2)`."""
 
-        bs = 512 * 1024  # no effect?
+        bs = self.acd_client._conf.getint('transfer','fs_chunk_size')
         return dict(f_bsize=bs,
                     f_frsize=bs,
                     f_blocks=self.total // bs,  # total no of blocks
