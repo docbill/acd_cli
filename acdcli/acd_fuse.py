@@ -49,7 +49,12 @@ except:
 
 _SETTINGS_FILENAME = 'fuse.ini'
 _XATTR_PROPERTY_NAME = 'xattrs'
+_XATTR_FUSE_STARTS_WITH = 'fuse.'
 _XATTR_MTIME_OVERRIDE_NAME = 'fuse.mtime'
+_XATTR_UID_OVERRIDE_NAME = 'fuse.uid'
+_XATTR_GID_OVERRIDE_NAME = 'fuse.gid'
+_XATTR_MODE_OVERRIDE_NAME = 'fuse.mode'
+_XATTR_JSON_NAME = 'fuse.json'
 
 _def_conf = configparser.ConfigParser()
 _def_conf['read'] = dict(open_chunk_limit=10, timeout=5)
@@ -359,6 +364,12 @@ class ACDFuse(LoggingMixIn, Operations):
         """lock for fh counter increment and handle dict writes"""
         self.nlinks = kwargs.get('nlinks', False)
         """whether to calculate the number of hardlinks for folders"""
+        self.uid = kwargs['uid']
+        """sets the default uid"""
+        self.gid = kwargs['gid']
+        """sets the default gid"""
+        self.umask = kwargs['umask']
+        """sets the default umask"""
 
         self.destroyed = autosync.keywords['stop']
         """:type: multiprocessing.Event"""
@@ -405,13 +416,30 @@ class ACDFuse(LoggingMixIn, Operations):
                      st_mtime=mtime,
                      st_ctime=node.created.timestamp())
 
+       
+        try:
+            mode = 0o07777 & int(str(self._getxattr(node.id, _XATTR_MODE_OVERRIDE_NAME)))
+        except:
+            if node.is_folder: mode = 0o0777 & ~self.umask
+            elif node.is_file: mode = 0o0666 & ~self.umask
+
+        try: uid = int(str(self._getxattr(node.id, _XATTR_UID_OVERRIDE_NAME)))
+        except: uid = self.uid
+
+        try: gid = int(str(self._getxattr(node.id, _XATTR_GID_OVERRIDE_NAME)))
+        except: gid = self.gid
+
         if node.is_folder:
-            return dict(st_mode=stat.S_IFDIR | 0o0777,
+            return dict(st_mode = stat.S_IFDIR | mode,
+                        st_uid = uid,
+                        st_gid = gid,
                         st_nlink=self.cache.num_children(node.id) if self.nlinks else 1,
                         **times)
         elif node.is_file:
             bs = self.acd_client._conf.getint('transfer','fs_chunk_size')
-            return dict(st_mode=stat.S_IFREG | 0o0666,
+            return dict(st_mode= stat.S_IFREG | mode,
+                        st_uid = uid,
+                        st_gid = gid,
                         st_nlink=self.cache.num_parents(node.id) if self.nlinks else 1,
                         st_size=size,
                         st_blksize=bs,
@@ -436,7 +464,8 @@ class ACDFuse(LoggingMixIn, Operations):
         node = self.cache.resolve(path)
         if not node:
             raise FuseOSError(errno.ENOENT)
-        return self._getxattr_bytes(node.id, name)
+        try: return self._getxattr_bytes(node.id, name)
+        except: return bytes(str(self._getxattr(node.id,name)),encoding="utf-8")
 
     def _getxattr(self, node_id, name):
         self._xattr_load(node_id)
@@ -451,7 +480,7 @@ class ACDFuse(LoggingMixIn, Operations):
                 raise FuseOSError(errno.ENODATA)  # should be ENOATTR
 
     def _getxattr_bytes(self, node_id, name):
-        return binascii.a2b_base64(self._getxattr(node_id, name))
+        return binascii.a2b_base64(self._getxattr(node_id, name).encode('utf-8'))
 
     def removexattr(self, path, name):
         node = self.cache.resolve(path)
@@ -470,7 +499,8 @@ class ACDFuse(LoggingMixIn, Operations):
         node = self.cache.resolve(path)
         if not node:
             raise FuseOSError(errno.ENOENT)
-        self._setxattr_bytes(node.id, name, value)
+        if not name.startswith(_XATTR_FUSE):
+            self._setxattr_bytes(node.id, name, value)
 
     def _setxattr(self, node_id, name, value):
         self._xattr_load(node_id)
@@ -490,14 +520,18 @@ class ACDFuse(LoggingMixIn, Operations):
                 xattrs_str = self.cache.get_property(node_id, self.acd_client_owner, _XATTR_PROPERTY_NAME)
                 try: self.xattr_cache[node_id] = json.loads(xattrs_str)
                 except: self.xattr_cache[node_id] = {}
+                self.xattr_cache[node_id][_XATTR_JSON_NAME] = str(xattrs_str)
 
     def _xattr_write_and_sync(self):
         with self.xattr_cache_lock:
             for node_id in self.xattr_dirty:
                 try:
+                    if _XATTR_JSON_NAME in self.xattr_cache[node_id]:
+                        del self.xattr_cache[node_id][_XATTR_JSON_NAME]
                     xattrs_str = json.dumps(self.xattr_cache[node_id])
                     self.acd_client.add_property(node_id, self.acd_client_owner, _XATTR_PROPERTY_NAME,
                                                  xattrs_str)
+                    self.xattr_cache[node_id]['fuse.RAW'] = 'json('+xattrs_str+')'
                 except (RequestError, IOError) as e:
                     logger.error('Error writing node xattrs "%s". %s' % (node_id, str(e)))
                 else:
@@ -769,13 +803,31 @@ class ACDFuse(LoggingMixIn, Operations):
         return 0
 
     def chmod(self, path, mode):
-        """Not implemented."""
-        pass
+        node = self.cache.resolve(path)
+        if not node:
+            raise FuseOSError(errno.ENOENT)
+        try:
+            self._setxattr(node.id, _XATTR_MODE_OVERRIDE_NAME, mode)
+            self._xattr_write_and_sync()
+        except:
+            raise FuseOSError(errno.ENOTSUP)
+
+        return 0
 
     def chown(self, path, uid, gid):
-        """Not implemented."""
-        pass
+        node = self.cache.resolve(path)
+        if not node:
+            raise FuseOSError(errno.ENOENT)
+        try:
+            if uid != -1:
+                self._setxattr(node.id, _XATTR_UID_OVERRIDE_NAME, uid)
+            if gid != -1:
+                self._setxattr(node.id, _XATTR_GID_OVERRIDE_NAME, gid)
+            self._xattr_write_and_sync()
+        except:
+            raise FuseOSError(errno.ENOTSUP)
 
+        return 0
 
 def mount(path: str, args: dict, **kwargs) -> 'Union[int, None]':
     """Fusermounts Amazon Cloud Drive to specified mountpoint.
